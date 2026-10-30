@@ -408,7 +408,11 @@ function Run-Dism {
     if (($code -ne 0) -and ($code -ne 3010) -and (-not [string]::IsNullOrEmpty($ImagePath))) {
         Write-Host 'Восстановление с ISO не удалось. Это не ошибка выбора индекса сама по себе:' -ForegroundColor Yellow
         Write-Host 'часть требуемых версий файлов может отсутствовать в образе; проверьте CBS.log.' -ForegroundColor Yellow
-        Write-Host 'Отсутствие /LimitAccess не гарантирует доступ к Microsoft Update при действующих политиках WSUS.' -ForegroundColor Yellow
+        if ($code -eq -2146498283) {
+            Write-Host 'Источник восстановления не предоставил необходимые компоненты. Подробности в CBS.log и DISM.log.' -ForegroundColor Yellow
+        } else {
+            Write-Host 'Причину ошибки восстановления смотрите в CBS.log и DISM.log.' -ForegroundColor Yellow
+        }
     }
     return $code
 }
