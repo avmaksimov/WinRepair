@@ -206,14 +206,25 @@ function Get-ImageDetails {
     param([string]$ImagePath, [int]$ImageIndex)
     $raw = @(& $script:DismExe /English /Get-WimInfo ("/WimFile:{0}" -f $ImagePath) ("/Index:{0}" -f $ImageIndex) 2>&1)
     if ([int]$LASTEXITCODE -ne 0) { return $null }
-    $body = [string]::Join("`n", [string[]]$raw)
+    $output = [string]::Join("`n", [string[]]$raw)
+    # DISM prints its OWN "Version: ..." before the image details. Parse only
+    # the "Details for image" section, never the executable banner.
+    $detailsHeading = [regex]::Match($output, '(?im)^\s*Details\s+for\s+image\s*:\s*[^\r\n]*')
+    if (-not $detailsHeading.Success) {
+        Write-Host 'Не удалось найти раздел метаданных образа в выводе DISM.' -ForegroundColor Yellow
+        return $null
+    }
+    $body = $output.Substring($detailsHeading.Index + $detailsHeading.Length)
     $result = New-Object PSObject -Property @{
-        Edition = ''; Architecture = ''; Installation = ''; Language = ''; Version = ''
+        Edition = ''; Architecture = ''; Installation = ''; Language = ''; Version = ''; ServicePackBuild = ''
     }
     foreach ($name in @('Edition', 'Architecture', 'Installation', 'Version')) {
+
         $match = [regex]::Match($body, ('(?im)^\s*{0}\s*:\s*(.*?)\s*$' -f $name))
         if ($match.Success) { $result.$name = $match.Groups[1].Value.Trim() }
     }
+    $servicePackBuild = [regex]::Match($body, '(?im)^\s*ServicePack Build\s*:\s*(\d+)\s*$')
+    if ($servicePackBuild.Success) { $result.ServicePackBuild = $servicePackBuild.Groups[1].Value }
     # Prefer the language explicitly marked as Default. A single-language image is unambiguous too.
     $languageHeading = [regex]::Match($body, '(?im)^\s*Languages\s*:\s*([^\r\n]*)')
     if ($languageHeading.Success) {
@@ -501,9 +512,14 @@ function Try-RepairFromImage {
     # Show the image version so the user can diagnose a missing repair payload.
     $details = Get-ImageDetails -ImagePath $image -ImageIndex $index
     if (($null -ne $details) -and (-not [string]::IsNullOrEmpty($details.Version))) {
-        Write-Host ('Версия Windows: {0}; версия образа ISO: {1}' -f $OsProfile.Version, $details.Version)
+        $displayVersion = [string]$details.Version
+        if (($details.ServicePackBuild -ne '') -and ($details.ServicePackBuild -ne '0')) {
+            $displayVersion += ('.' + $details.ServicePackBuild)
+        }
+        Write-Host ('Версия Windows: {0}; версия образа ISO: {1}' -f $OsProfile.Version, $displayVersion)
         if (($OsProfile.Version -ne '') -and ($details.Version -ine $OsProfile.Version)) {
-            Write-Host 'Версии отличаются: ISO может не содержать требуемые компоненты и их обновления.' -ForegroundColor Yellow
+            Write-Host 'Версии различаются: образ для обновления Windows может иметь более новую сборку.' -ForegroundColor Yellow
+            Write-Host 'Для DISM /RestoreHealth важно наличие конкретных версий повреждённых компонентов.' -ForegroundColor Yellow
         }
     }
     return (Run-Dism -ImagePath $image -ImageIndex $index)
