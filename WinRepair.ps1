@@ -427,6 +427,21 @@ function Schedule-SystemVolumeCheck {
     }
 }
 
+# Keep the native Repair-Volume progress, but put the actual drive letter
+# in the command text shown by the PowerShell host (rather than $letter).
+# Both interpolated values are strictly validated before building the block.
+function Invoke-RepairVolume {
+    param(
+        [char]$DriveLetter,
+        [ValidateSet('Scan', 'SpotFix', 'OfflineScanAndFix')][string]$Mode
+    )
+    $name = [string]$DriveLetter
+    if ($name -notmatch '^[A-Za-z]$') { throw 'Некорректная буква тома.' }
+    $command = ('Repair-Volume -DriveLetter {0} -{1} -ErrorAction Stop' -f $name, $Mode)
+    if ($Mode -ne 'Scan') { $command += ' -Confirm:$false' }
+    & ([scriptblock]::Create($command))
+}
+
 function Test-SystemVolume {
     param([version]$OsVersion)
     $drive = [string]$env:SystemDrive
@@ -442,7 +457,7 @@ function Test-SystemVolume {
         $cmdlet = Get-Command Repair-Volume -ErrorAction SilentlyContinue
         if ($null -ne $cmdlet) {
             try {
-                $scan = @(Repair-Volume -DriveLetter $letter -Scan -ErrorAction Stop)
+                $scan = @(Invoke-RepairVolume -DriveLetter $letter -Mode Scan)
                 if ($scan.Count -ne 1) { throw 'Repair-Volume вернул пустой или неоднозначный результат.' }
                 $status = ([string]$scan[0]).Trim()
                 $script:VolumeStatus = $status
@@ -459,12 +474,12 @@ function Test-SystemVolume {
                     if (Ask-YesNo ('Попробовать Repair-Volume -{0} для {1}?' -f $mode, $drive) $true) {
                         try {
                             if ($spot) {
-                                $fix = @(Repair-Volume -DriveLetter $letter -SpotFix -Confirm:$false -ErrorAction Stop)
+                                $fix = @(Invoke-RepairVolume -DriveLetter $letter -Mode SpotFix)
                             } else {
-                                $fix = @(Repair-Volume -DriveLetter $letter -OfflineScanAndFix -Confirm:$false -ErrorAction Stop)
+                                $fix = @(Invoke-RepairVolume -DriveLetter $letter -Mode OfflineScanAndFix)
                             }
                             Write-Host ('Результат исправления: ' + ($fix -join ', '))
-                            $verify = @(Repair-Volume -DriveLetter $letter -Scan -ErrorAction Stop)
+                            $verify = @(Invoke-RepairVolume -DriveLetter $letter -Mode Scan)
                             if (($verify.Count -eq 1) -and (([string]$verify[0]).Trim() -eq 'NoErrorsFound')) {
                                 $script:VolumeNeedsAttention = $false
                                 $script:VolumeStatus = 'Repaired'
