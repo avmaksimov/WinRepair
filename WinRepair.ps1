@@ -3,6 +3,7 @@
 WinRepair: OS-aware Windows repair (Windows 7/Server 2008 R2 and newer).
 - Windows client 8+: first try DISM with default source. Offer ISO/WIM/ESD on failure.
 - Windows Server 2012+: ask for source immediately, but allow default source.
+- Check the system volume before Windows repair (Repair-Volume or CHKDSK).
 - Windows 7 / Server 2008 R2 and earlier: no unsupported RestoreHealth; run SFC.
 - Run SFC after DISM, including failed DISM; Ctrl+C cancels the entire script.
 - No WSUS policy changes, component cleanup, cache reset, or reboot; DISM may access Windows Update.
@@ -19,7 +20,12 @@ function Test-ExplorerLaunch {
         $current = Get-WmiObject -Class Win32_Process -Filter ("ProcessId = {0}" -f $PID) -ErrorAction Stop
         if (($null -eq $current) -or ($current.CommandLine -notmatch '(?i)(?:^|\s)-(?:file|command)\b')) { return $false }
         $parent = Get-WmiObject -Class Win32_Process -Filter ("ProcessId = {0}" -f $current.ParentProcessId) -ErrorAction Stop
-        return (($null -ne $parent) -and ($parent.Name -ieq 'explorer.exe'))
+        # A console opened from Explorer may be parented by explorer.exe,
+        # svchost.exe (AppInfo / UAC), or another shell broker.
+        # A shell launched from an existing console must not be paused.
+        if ($null -eq $parent) { return $true }
+        $interactiveShells = @('powershell.exe', 'pwsh.exe', 'cmd.exe', 'wt.exe', 'windowsterminal.exe', 'openconsole.exe')
+        return (-not ($interactiveShells -contains $parent.Name.ToLowerInvariant()))
     } catch { return $false }
 }
 function Wait-ForExitKey {
@@ -36,6 +42,11 @@ $script:ElevationStarted = $false
 
 $script:DiskResult = $null
 $script:SfcResult = $null
+$script:VolumeStatus = 'Не проверялся'
+$script:VolumeNeedsAttention = $false
+$script:VolumeScheduled = $false
+$script:RestartRequested = $false
+$script:RestartInitiated = $false
 $script:HadError = $false
 $script:TranscriptOn = $false
 $script:LogPath = $null
@@ -46,6 +57,8 @@ if (($env:PROCESSOR_ARCHITEW6432 -ne $null) -and ($env:PROCESSOR_ARCHITEW6432 -n
 }
 $script:DismExe = Join-Path $script:ProgramDirectory 'dism.exe'
 $script:SfcExe = Join-Path $script:ProgramDirectory 'sfc.exe'
+$script:ChkdskExe = Join-Path $script:ProgramDirectory 'chkdsk.exe'
+$script:ChkntfsExe = Join-Path $script:ProgramDirectory 'chkntfs.exe'
 
 function Ask-YesNo {
     param([string]$Question, [bool]$DefaultYes)
@@ -373,6 +386,105 @@ function Run-Dism {
     return $code
 }
 
+
+# Schedule an offline repair only with the user's explicit approval.
+function Schedule-SystemVolumeCheck {
+    param([string]$Drive)
+    if (-not (Ask-YesNo ('Запланировать исправление {0} при следующей загрузке?' -f $Drive) $true)) {
+        Write-Host 'Проверка при загрузке не запланирована.' -ForegroundColor Yellow
+        return
+    }
+    $code = Invoke-RepairExecutable -Executable $script:ChkntfsExe -Arguments ('/c ' + $Drive)
+    if ($code -eq 0) {
+        $script:VolumeScheduled = $true
+        $script:VolumeNeedsAttention = $true
+        $script:VolumeStatus = 'ScheduledAtBoot'
+        Write-Host 'Исправление запланировано при следующей загрузке.' -ForegroundColor Yellow
+    } else {
+        Write-Host ('Ошибка chkntfs: ' + (Format-ExitCode $code)) -ForegroundColor Red
+    }
+}
+
+function Test-SystemVolume {
+    param([version]$OsVersion)
+    $drive = [string]$env:SystemDrive
+    if ($drive -notmatch '^[A-Za-z]:$') {
+        $script:VolumeStatus = 'UnknownSystemDrive'
+        $script:VolumeNeedsAttention = $true
+        Write-Host ('Не удалось определить системный том: ' + $drive) -ForegroundColor Red
+        return
+    }
+    $letter = [char]$drive.Substring(0, 1)
+    Write-Host ("`nПроверка файловой системы {0}..." -f $drive) -ForegroundColor Cyan
+    if ($OsVersion -ge [version]'6.2') {
+        $cmdlet = Get-Command Repair-Volume -ErrorAction SilentlyContinue
+        if ($null -ne $cmdlet) {
+            try {
+                $scan = @(Repair-Volume -DriveLetter $letter -Scan -ErrorAction Stop)
+                if ($scan.Count -ne 1) { throw 'Repair-Volume вернул пустой или неоднозначный результат.' }
+                $status = ([string]$scan[0]).Trim()
+                $script:VolumeStatus = $status
+                Write-Host ('Repair-Volume -Scan: ' + $status)
+                if ($status -eq 'NoErrorsFound') {
+                    Write-Host 'Файловая система исправна.' -ForegroundColor Green
+                    return
+                }
+                if (@('SpotFixNeeded', 'OfflineScanAndFixNeeded', 'ScanNeeded') -contains $status) {
+                    $script:VolumeNeedsAttention = $true
+                    Write-Host ('Тому требуется исправление или дополнительная проверка: ' + $status) -ForegroundColor Yellow
+                    $spot = ($status -eq 'SpotFixNeeded')
+                    $mode = if ($spot) { 'SpotFix' } else { 'OfflineScanAndFix' }
+                    if (Ask-YesNo ('Попробовать Repair-Volume -{0} для {1}?' -f $mode, $drive) $true) {
+                        try {
+                            if ($spot) {
+                                $fix = @(Repair-Volume -DriveLetter $letter -SpotFix -Confirm:$false -ErrorAction Stop)
+                            } else {
+                                $fix = @(Repair-Volume -DriveLetter $letter -OfflineScanAndFix -Confirm:$false -ErrorAction Stop)
+                            }
+                            Write-Host ('Результат исправления: ' + ($fix -join ', '))
+                            $verify = @(Repair-Volume -DriveLetter $letter -Scan -ErrorAction Stop)
+                            if (($verify.Count -eq 1) -and (([string]$verify[0]).Trim() -eq 'NoErrorsFound')) {
+                                $script:VolumeNeedsAttention = $false
+                                $script:VolumeStatus = 'Repaired'
+                                Write-Host 'Повторная проверка: ошибок нет.' -ForegroundColor Green
+                                return
+                            }
+                            Write-Host ('После исправления ещё требуется проверка: ' + ($verify -join ', ')) -ForegroundColor Yellow
+                        } catch [System.Management.Automation.PipelineStoppedException] {
+                            throw
+                        } catch {
+                            Write-Host ('Онлайн-исправление не завершено: ' + $_.Exception.Message) -ForegroundColor Yellow
+                        }
+                    }
+                    Schedule-SystemVolumeCheck -Drive $drive
+                    return
+                }
+                Write-Host 'Неизвестный статус Repair-Volume; перехожу к CHKDSK.' -ForegroundColor Yellow
+            } catch [System.Management.Automation.PipelineStoppedException] {
+                throw
+            } catch {
+                Write-Host ('Не удалось проверить том через Repair-Volume: ' + $_.Exception.Message) -ForegroundColor Yellow
+                Write-Host 'Перехожу к CHKDSK без исправления.' -ForegroundColor Yellow
+            }
+        } else {
+            Write-Host 'Repair-Volume недоступен, использую CHKDSK.' -ForegroundColor Yellow
+        }
+    } else {
+        Write-Host 'Windows 7 / Server 2008 R2: CHKDSK без исправления.' -ForegroundColor Cyan
+    }
+    # Read-only fallback: neither /f nor /r is used automatically.
+    $code = Invoke-RepairExecutable -Executable $script:ChkdskExe -Arguments $drive
+    $script:VolumeStatus = ('CHKDSK ' + (Format-ExitCode $code))
+    if ($code -eq 0) {
+        Write-Host 'CHKDSK: ошибок не обнаружено.' -ForegroundColor Green
+        return
+    }
+    $script:VolumeNeedsAttention = $true
+    Write-Host ('CHKDSK: ' + (Format-ExitCode $code)) -ForegroundColor Yellow
+    Write-Host 'Возможны ошибки файловой системы или невозможность проверки. Изучите вывод.'
+    Schedule-SystemVolumeCheck -Drive $drive
+}
+
 function Try-RepairFromImage {
     param([string]$OsCaption, $OsProfile, [bool]$IsServer)
     $image = Choose-Image
@@ -445,51 +557,69 @@ try {
     $profile = Get-OsImageProfile -OperatingSystem $os -Edition $edition -IsServer $isServer
 
     Write-Host '==============================================================='
-    Write-Host 'WinRepair: восстановление Windows (DISM, SFC)' -ForegroundColor Cyan
+    Write-Host 'WinRepair: проверка диска, DISM, SFC' -ForegroundColor Cyan
     Write-Host ('ОС: {0} (версия {1})' -f $os.Caption, $os.Version)
     Write-Host ('Редакция: {0}; тип: {1}' -f $edition, $(if ($isServer) { 'Server' } else { 'Client' }))
     Write-Host '==============================================================='
-    Write-Host 'Скрипт не изменяет политики WSUS, не чистит кэш и не перезагружает ОС.'
+    Write-Host 'Скрипт не изменяет WSUS, не чистит кэш и не перезагружает ОС без разрешения.'
     Write-Host 'Ctrl+C — прервать всю диагностику (включая текущую операцию).' -ForegroundColor Yellow
 
-    if (-not $canRestoreHealth) {
-        Write-Host ''
-        Write-Host 'На Windows 7 / Windows Server 2008 R2 DISM /RestoreHealth не поддерживается.' -ForegroundColor Yellow
-        Write-Host 'Будет выполнен только SFC. Для восстановления хранилища используйте KB947821 (CheckSUR).'
-        Write-Host 'https://www.catalog.update.microsoft.com/Search.aspx?q=KB947821'
-    } else {
-        if ($isServer) {
-            Write-Host ''
-            Write-Host 'Windows Server: укажите ISO/WIM/ESD, если он доступен (Enter — без источника).' -ForegroundColor Yellow
-            $script:DiskResult = Try-RepairFromImage -OsCaption $os.Caption -OsProfile $profile -IsServer $isServer
-            if ($null -eq $script:DiskResult) {
-                Write-Host 'Источник не выбран. Запускается DISM с настройками источника по умолчанию.'
-                $script:DiskResult = Run-Dism -ImagePath $null -ImageIndex 0
-            }
-        } else {
-            Write-Host "`nWindows Client: сначала DISM без ISO." -ForegroundColor Cyan
-            $script:DiskResult = Run-Dism -ImagePath $null -ImageIndex 0
-        }
-        if (($script:DiskResult -ne 0) -and ($script:DiskResult -ne 3010)) {
-            if (Ask-YesNo 'DISM завершился ошибкой. Попробовать (другой) ISO/WIM/ESD?' $true) {
-                $ret = Try-RepairFromImage -OsCaption $os.Caption -OsProfile $profile -IsServer $isServer
-                if ($null -ne $ret) { $script:DiskResult = $ret }
-                else { Write-Host 'Повторное восстановление с ISO отменено. Исходная ошибка DISM сохраняется.' -ForegroundColor Yellow }
-            }
+    Test-SystemVolume -OsVersion $version
+    $skipWindowsRepair = $script:VolumeScheduled
+    if ($script:VolumeNeedsAttention -and (-not $skipWindowsRepair)) {
+        Write-Host 'Исправность файловой системы не подтверждена.' -ForegroundColor Yellow
+        if (-not (Ask-YesNo 'Продолжить DISM/SFC несмотря на состояние диска?' $false)) {
+            $skipWindowsRepair = $true
         }
     }
+    if ($skipWindowsRepair) {
+        Write-Host 'DISM и SFC пропущены; сначала исправьте файловую систему.' -ForegroundColor Yellow
+    } else {
+        if (-not $canRestoreHealth) {
+            Write-Host ''
+            Write-Host 'На Windows 7 / Windows Server 2008 R2 DISM /RestoreHealth не поддерживается.' -ForegroundColor Yellow
+            Write-Host 'Будет выполнен только SFC. Для восстановления хранилища используйте KB947821 (CheckSUR).'
+            Write-Host 'https://www.catalog.update.microsoft.com/Search.aspx?q=KB947821'
+        } else {
+            if ($isServer) {
+                Write-Host ''
+                Write-Host 'Windows Server: укажите ISO/WIM/ESD, если он доступен (Enter — без источника).' -ForegroundColor Yellow
+                $script:DiskResult = Try-RepairFromImage -OsCaption $os.Caption -OsProfile $profile -IsServer $isServer
+                if ($null -eq $script:DiskResult) {
+                    Write-Host 'Источник не выбран. Запускается DISM с настройками источника по умолчанию.'
+                    $script:DiskResult = Run-Dism -ImagePath $null -ImageIndex 0
+                }
+            } else {
+                Write-Host "`nWindows Client: сначала DISM без ISO." -ForegroundColor Cyan
+                $script:DiskResult = Run-Dism -ImagePath $null -ImageIndex 0
+            }
+            if (($script:DiskResult -ne 0) -and ($script:DiskResult -ne 3010)) {
+                if (Ask-YesNo 'DISM завершился ошибкой. Попробовать (другой) ISO/WIM/ESD?' $true) {
+                    $ret = Try-RepairFromImage -OsCaption $os.Caption -OsProfile $profile -IsServer $isServer
+                    if ($null -ne $ret) { $script:DiskResult = $ret }
+                    else { Write-Host 'Повторное восстановление с ISO отменено. Исходная ошибка DISM сохраняется.' -ForegroundColor Yellow }
+                }
+            }
+        }
 
-    # SFC must NOT be in finally: Ctrl+C must not launch the next repair operation.
-    Write-Host "`nПроверка системных файлов: SFC /scannow" -ForegroundColor Cyan
-    $script:SfcResult = Invoke-RepairExecutable -Executable $script:SfcExe -Arguments '/scannow' 
+        # SFC must NOT be in finally: Ctrl+C must not launch the next repair operation.
+        Write-Host "`nПроверка системных файлов: SFC /scannow" -ForegroundColor Cyan
+        $script:SfcResult = Invoke-RepairExecutable -Executable $script:SfcExe -Arguments '/scannow'
+    }
     Write-Host ''
     Write-Host '====================== ИТОГ ======================' -ForegroundColor Cyan
+    Write-Host ('Системный том: ' + $script:VolumeStatus)
+    if ($script:VolumeScheduled) { Write-Host 'Исправление запланировано при загрузке.' -ForegroundColor Yellow }
     if ($null -ne $script:DiskResult) {
         Write-Host ('DISM: ' + (Format-ExitCode $script:DiskResult))
     } else {
         Write-Host 'DISM: не запускался или восстановление отменено.'
     }
-    Write-Host ('SFC:  ' + (Format-ExitCode $script:SfcResult))
+    if ($null -ne $script:SfcResult) {
+        Write-Host ('SFC:  ' + (Format-ExitCode $script:SfcResult))
+    } else {
+        Write-Host 'SFC: не запускался.'
+    }
     Write-Host 'Результат SFC нужно оценить также по тексту его сообщения.'
     Write-Host ('DISM журнал: ' + (Join-Path $env:SystemRoot 'Logs\DISM\dism.log'))
     Write-Host ('CBS журнал:  ' + (Join-Path $env:SystemRoot 'Logs\CBS\CBS.log'))
@@ -500,9 +630,25 @@ try {
         Write-Host 'DISM не восстановил хранилище. Проверьте сообщения DISM и CBS.' -ForegroundColor Yellow
         $script:HadError = $true
     }
-    if ($script:SfcResult -ne 0) { $script:HadError = $true }
+    if (($null -ne $script:SfcResult) -and ($script:SfcResult -ne 0)) { $script:HadError = $true }
+    if ($script:VolumeNeedsAttention) { $script:HadError = $true }
     if ($script:DiskResult -eq 3010) { Write-Host 'DISM сообщил, что требуется перезагрузка (она не выполнялась).' -ForegroundColor Yellow }
     Write-Host '=================================================='
+    if ($script:VolumeScheduled) {
+        Write-Host 'Сохраните файлы перед перезагрузкой; затем повторите WinRepair.'
+        $script:RestartRequested = Ask-YesNo 'Перезагрузить компьютер сейчас?' $false
+    }
+    if ($script:RestartRequested) {
+        try {
+            Restart-Computer -ErrorAction Stop
+            $script:RestartInitiated = $true
+        } catch [System.Management.Automation.PipelineStoppedException] {
+            throw
+        } catch {
+            Write-Host ('Не удалось перезагрузить компьютер: ' + $_.Exception.Message) -ForegroundColor Red
+            $script:HadError = $true
+        }
+    }
 } catch {
     # All unexpected failures, including cancellation, end the complete script.
     Write-Host ('Ошибка WinRepair: ' + $_.Exception.Message) -ForegroundColor Red
@@ -512,6 +658,8 @@ try {
     if ($script:TranscriptOn) {
         try { Stop-Transcript | Out-Null } catch { }
     }
-    if (-not $script:ElevationStarted) { Wait-ForExitKey }
+    if ((-not $script:ElevationStarted) -and (-not $script:RestartInitiated)) {
+        Wait-ForExitKey
+    }
 }
 if ($script:HadError) { exit 1 } else { exit 0 }
