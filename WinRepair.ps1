@@ -137,35 +137,40 @@ function Find-ImagesOnDrives {
 }
 
 function Choose-Image {
-    Write-Host ''
-    Write-Host 'Поиск установочного образа на доступных дисках...' -ForegroundColor Cyan
-    $found = @(Find-ImagesOnDrives)
-    if ($found.Count -eq 1) {
-        Write-Host ('Найден один образ: ' + $found[0]) -ForegroundColor Green
-        Write-Host 'Используется найденный образ. Если он не подходит, можно выбрать другой при следующей попытке.'
-        return [string]$found[0]
-    }
-    if ($found.Count -gt 1) {
-        Write-Host 'Найдено несколько образов:' -ForegroundColor Cyan
-        for ($i = 0; $i -lt $found.Count; $i++) {
-            Write-Host (' {0}. {1}' -f ($i + 1), $found[$i])
+    param([switch]$AskForDrive)
+    # After failed DISM without ISO, ask for the mounted drive directly.
+    # For other scenarios, retain the existing automatic image discovery.
+    if (-not $AskForDrive) {
+        Write-Host ''
+        Write-Host 'Поиск установочного образа на доступных дисках...' -ForegroundColor Cyan
+        $found = @(Find-ImagesOnDrives)
+        if ($found.Count -eq 1) {
+            Write-Host ('Найден один образ: ' + $found[0]) -ForegroundColor Green
+            Write-Host 'Используется найденный образ. Если он не подходит, можно выбрать другой при следующей попытке.'
+            return [string]$found[0]
         }
-        while ($true) {
-            $answer = (Read-Host 'Номер образа (Enter — указать другую букву)').Trim()
-            if ($answer -eq '') { break }
-            $selected = 0
-            if ([int]::TryParse($answer, [ref]$selected) -and $selected -gt 0 -and $selected -le $found.Count) {
-                return [string]$found[$selected - 1]
+        if ($found.Count -gt 1) {
+            Write-Host 'Найдено несколько образов:' -ForegroundColor Cyan
+            for ($i = 0; $i -lt $found.Count; $i++) {
+                Write-Host (' {0}. {1}' -f ($i + 1), $found[$i])
             }
-            Write-Host 'Неверный номер.' -ForegroundColor Yellow
+            while ($true) {
+                $answer = (Read-Host 'Номер образа (Enter — указать другую букву)').Trim()
+                if ($answer -eq '') { break }
+                $selected = 0
+                if ([int]::TryParse($answer, [ref]$selected) -and $selected -gt 0 -and $selected -le $found.Count) {
+                    return [string]$found[$selected - 1]
+                }
+                Write-Host 'Неверный номер.' -ForegroundColor Yellow
+            }
+        } else {
+            Write-Host 'Смонтированный установочный образ автоматически не найден.' -ForegroundColor Yellow
         }
-    } else {
-        Write-Host 'Смонтированный установочный образ автоматически не найден.' -ForegroundColor Yellow
     }
     Write-Host ''
-    Write-Host 'Смонтируйте ISO Windows и укажите БУКВУ его диска без двоеточия (например, E).' -ForegroundColor Cyan
+    Write-Host 'Смонтируйте установочный ISO Windows и введите букву его диска без двоеточия (например, E).' -ForegroundColor Cyan
     Write-Host 'При необходимости допускается полный путь к install.wim / install.esd.'
-    Write-Host 'Enter — отменить попытку с образом и перейти к SFC.'
+    Write-Host 'Enter — пропустить восстановление из ISO и перейти к SFC.'
     while ($true) {
         $raw = (Read-Host 'Буква диска').Trim()
         if ($raw.Length -eq 0) { return $null }
@@ -647,8 +652,8 @@ function Offer-InPlaceWindowsSetup {
 }
 
 function Try-RepairFromImage {
-    param([string]$OsCaption, $OsProfile, [bool]$IsServer)
-    $image = Choose-Image
+    param([string]$OsCaption, $OsProfile, [bool]$IsServer, [switch]$AskForDrive)
+    $image = Choose-Image -AskForDrive:$AskForDrive
     if ($null -eq $image) { return $null }
     $index = Choose-ImageIndex -ImagePath $image -OsCaption $OsCaption -OsProfile $OsProfile -IsServer $IsServer
     if ($null -eq $index) { return $null }
@@ -766,8 +771,16 @@ try {
                 $script:DiskResult = Run-Dism -ImagePath $null -ImageIndex 0
             }
             if (($script:DiskResult -ne 0) -and ($script:DiskResult -ne 3010)) {
-                if (Ask-YesNo 'DISM завершился ошибкой. Попробовать (другой) ISO/WIM/ESD?' $true) {
-                    $ret = Try-RepairFromImage -OsCaption $os.Caption -OsProfile $profile -IsServer $isServer
+                if ($null -eq $script:SelectedRepairImage) {
+                    # The first attempt used the built-in/default source.
+                    # A mounted ISO can now be entered without an extra Y/N prompt.
+                    Write-Host ''
+                    Write-Host 'DISM не смог восстановить Windows со штатным источником.' -ForegroundColor Yellow
+                    $ret = Try-RepairFromImage -OsCaption $os.Caption -OsProfile $profile -IsServer $isServer -AskForDrive
+                    if ($null -ne $ret) { $script:DiskResult = $ret }
+                    else { Write-Host 'Источник восстановления не выбран. Переходим к SFC.' -ForegroundColor Yellow }
+                } elseif (Ask-YesNo 'Восстановление с выбранным образом не удалось. Попробовать другой ISO/WIM/ESD?' $true) {
+                    $ret = Try-RepairFromImage -OsCaption $os.Caption -OsProfile $profile -IsServer $isServer -AskForDrive
                     if ($null -ne $ret) { $script:DiskResult = $ret }
                     else { Write-Host 'Повторное восстановление с ISO отменено. Исходная ошибка DISM сохраняется.' -ForegroundColor Yellow }
                 }
