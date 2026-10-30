@@ -546,8 +546,7 @@ try {
     }
 
     try {
-        $folder = Join-Path $env:TEMP 'WinRepair\Logs'
-        if (-not (Test-Path -LiteralPath $folder)) { New-Item -Path $folder -ItemType Directory -Force -ErrorAction Stop | Out-Null }
+        $folder = $env:TEMP
         $script:LogPath = Join-Path $folder ('WinRepair_{0}.log' -f (Get-Date -Format 'yyyyMMdd_HHmmss'))
         Start-Transcript -Path $script:LogPath -ErrorAction Stop | Out-Null
         $script:TranscriptOn = $true
@@ -657,7 +656,7 @@ try {
         $quotedLog = $script:LogPath.Replace("'", "''")
         Write-Host ("Get-Content -LiteralPath '{0}' | Select-Object -Last 80" -f $quotedLog)
     } else {
-        Write-Host 'Get-ChildItem "$env:TEMP\WinRepair\Logs\WinRepair_*.log" | Sort-Object LastWriteTime -Descending | Select-Object -First 1 | Get-Content | Select-Object -Last 80'
+        Write-Host 'Get-ChildItem "$env:TEMP\WinRepair_*.log" | Sort-Object LastWriteTime -Descending | Select-Object -First 1 | Get-Content | Select-Object -Last 80'
     }
     if (($null -ne $script:DiskResult) -and ($script:DiskResult -ne 0) -and ($script:DiskResult -ne 3010)) {
         Write-Host 'Последние характерные ошибки CBS:' -ForegroundColor Yellow
