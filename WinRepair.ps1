@@ -625,14 +625,7 @@ function Offer-InPlaceWindowsSetup {
     Write-Host ('  Установщик:    {0}' -f $setup)
     Write-Host 'Совпадение редакции, архитектуры и языка подтверждено; версию ISO проверили.' -ForegroundColor Green
     Write-Host 'Внимательно проверьте обе редакции и индекс перед запуском.' -ForegroundColor Yellow
-    Write-Host 'Параметры установки:'
-    Write-Host '  /Auto Upgrade       — обновление с сохранением приложений и файлов; несовместимость приведёт к отказу, не к чистой установке.'
-    Write-Host ('  /ImageIndex {0}       — установить выбранный образ с индексом {0} ({1}).' -f $index, $details.Name)
-    Write-Host '  /DynamicUpdate Disable — не загружать обновления и драйверы во время установки.'
-    Write-Host '  /EULA Accept        — принять лицензионное соглашение Windows.'
-    Write-Host '  /Quiet НЕ используется: окна установки и предупреждения остаются видимыми.'
-    Write-Host 'Внимание: заранее сохраните важные данные. Установка может перезагружать компьютер.' -ForegroundColor Yellow
-    Write-Host ('Команда: & ''{0}'' {1}' -f $setup.Replace("'", "''"), $args)
+    Write-Host ''
     if (-not (Ask-YesNo ('Запустить установку Windows поверх с сохранением программ и данных ({0})?' -f $args) $true)) {
         Write-Host 'Запуск установки отменён пользователем.'
         return
