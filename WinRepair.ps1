@@ -6,7 +6,7 @@ WinRepair: OS-aware Windows repair (Windows 7/Server 2008 R2 and newer).
 - Check the system volume before Windows repair (Repair-Volume or CHKDSK).
 - Windows 7 / Server 2008 R2 and earlier: no unsupported RestoreHealth; run SFC.
 - Run SFC after DISM, including failed DISM; Ctrl+C cancels the entire script.
-- No WSUS policy changes, component cleanup, cache reset, or reboot; DISM may access Windows Update.
+- No WSUS policy changes, component cleanup or cache reset; reboot only with consent.
 - Compatible with Windows PowerShell 2.0 (shipped with Windows 7).
 #>
 # Internal switch used by the elevated child to keep its console visible.
@@ -17,24 +17,30 @@ param([switch]$PauseAtExit)
 function Test-ExplorerLaunch {
     try {
         if (-not [Environment]::UserInteractive) { return $false }
+        # Explorer and UAC may launch PowerShell via another intermediate
+        # process. A process started with -File/-Command has its own lifetime;
+        # pause it regardless of parent ancestry. Invoking this script with &
+        # in an existing interactive console does not open a new process.
         $current = Get-WmiObject -Class Win32_Process -Filter ("ProcessId = {0}" -f $PID) -ErrorAction Stop
-        if (($null -eq $current) -or ($current.CommandLine -notmatch '(?i)(?:^|\s)-(?:file|command)\b')) { return $false }
-        $parent = Get-WmiObject -Class Win32_Process -Filter ("ProcessId = {0}" -f $current.ParentProcessId) -ErrorAction Stop
-        # A console opened from Explorer may be parented by explorer.exe,
-        # svchost.exe (AppInfo / UAC), or another shell broker.
-        # A shell launched from an existing console must not be paused.
-        if ($null -eq $parent) { return $true }
-        $interactiveShells = @('powershell.exe', 'pwsh.exe', 'cmd.exe', 'wt.exe', 'windowsterminal.exe', 'openconsole.exe')
-        return (-not ($interactiveShells -contains $parent.Name.ToLowerInvariant()))
-    } catch { return $false }
+        if ($null -eq $current) { return $false }
+        return ([string]$current.CommandLine -match '(?i)(?:^|\s)-(?:file|command)\b')
+    } catch {
+        # If parent/command line inspection fails, prefer a visible result for
+        # console sessions rather than closing the diagnostic window.
+        return [Environment]::UserInteractive
+    }
 }
 function Wait-ForExitKey {
     if (-not $script:PauseAtExit) { return }
+    Write-Host ''
+    Write-Host 'Нажмите любую клавишу для закрытия окна...'
     try {
-        Write-Host ''
-        Write-Host 'Press any key to finish...'
         [void][Console]::ReadKey($true)
-    } catch { }
+    } catch {
+        # ReadKey is not available for every console host; Read-Host is a
+        # compatible fallback on Windows PowerShell 2.0 and later.
+        try { [void](Read-Host 'Нажмите Enter для выхода') } catch { }
+    }
 }
 $script:PauseAtExit = ([bool]$PauseAtExit -or (Test-ExplorerLaunch))
 $script:ElevationStarted = $false
@@ -525,6 +531,7 @@ try {
                     Write-Host ('Сетевой диск: использую UNC-путь ' + $scriptFile)
                 }
             }
+            # Child explicitly pauses at completion (no persistent -NoExit session).
             $arguments = '-NoProfile -ExecutionPolicy Bypass -File "{0}" -PauseAtExit' -f $scriptFile
             # Use a guaranteed local working directory (not a mapped network drive).
             Start-Process -FilePath (Join-Path $PSHOME 'powershell.exe') `
@@ -539,11 +546,12 @@ try {
     }
 
     try {
-        $folder = Join-Path $env:ProgramData 'WinRepair\Logs'
+        $folder = Join-Path $env:TEMP 'WinRepair\Logs'
         if (-not (Test-Path -LiteralPath $folder)) { New-Item -Path $folder -ItemType Directory -Force -ErrorAction Stop | Out-Null }
         $script:LogPath = Join-Path $folder ('WinRepair_{0}.log' -f (Get-Date -Format 'yyyyMMdd_HHmmss'))
         Start-Transcript -Path $script:LogPath -ErrorAction Stop | Out-Null
         $script:TranscriptOn = $true
+        Write-Host ('Журнал WinRepair: ' + $script:LogPath)
     } catch {
         Write-Host ('Не удалось включить журнал действий: ' + $_.Exception.Message) -ForegroundColor Yellow
     }
@@ -628,11 +636,33 @@ try {
     }
     if (($null -ne $script:DiskResult) -and ($script:DiskResult -ne 0) -and ($script:DiskResult -ne 3010)) {
         Write-Host 'DISM не восстановил хранилище. Проверьте сообщения DISM и CBS.' -ForegroundColor Yellow
+        Write-Host ''
+        Write-Host 'Если восстановление через DISM/ISO не помогает:' -ForegroundColor Yellow
+        Write-Host '  Рассмотрите установку совместимой версии Windows поверх существующей.'
+        Write-Host '  Из запущенной Windows смонтируйте ISO и запустите setup.exe.'
+        Write-Host '  Выбирайте только «Сохранить личные файлы и приложения».'
+        Write-Host '  Если такой вариант недоступен, отмените установку.'
+        Write-Host '  Перед установкой создайте резервную копию важных данных.'
         $script:HadError = $true
     }
     if (($null -ne $script:SfcResult) -and ($script:SfcResult -ne 0)) { $script:HadError = $true }
     if ($script:VolumeNeedsAttention) { $script:HadError = $true }
     if ($script:DiskResult -eq 3010) { Write-Host 'DISM сообщил, что требуется перезагрузка (она не выполнялась).' -ForegroundColor Yellow }
+
+    Write-Host ''
+    Write-Host 'Для просмотра результата в новом окне PowerShell:' -ForegroundColor Cyan
+    if ($script:LogPath -ne $null -and (Test-Path -LiteralPath $script:LogPath)) {
+        # Quoting with doubled apostrophes keeps the command copyable even
+        # when the log directory contains apostrophes.
+        $quotedLog = $script:LogPath.Replace("'", "''")
+        Write-Host ("Get-Content -LiteralPath '{0}' | Select-Object -Last 80" -f $quotedLog)
+    } else {
+        Write-Host 'Get-ChildItem "$env:TEMP\WinRepair\Logs\WinRepair_*.log" | Sort-Object LastWriteTime -Descending | Select-Object -First 1 | Get-Content | Select-Object -Last 80'
+    }
+    if (($null -ne $script:DiskResult) -and ($script:DiskResult -ne 0) -and ($script:DiskResult -ne 3010)) {
+        Write-Host 'Последние характерные ошибки CBS:' -ForegroundColor Yellow
+        Write-Host 'Select-String -Path "$env:windir\Logs\CBS\CBS.log" -Pattern "CSI Payload Corrupt","CBS_E_","Missing replacement","Failed to resolve","0x800f" | Select-Object -Last 30'
+    }
     Write-Host '=================================================='
     if ($script:VolumeScheduled) {
         Write-Host 'Сохраните файлы перед перезагрузкой; затем повторите WinRepair.'
