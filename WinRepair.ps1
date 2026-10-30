@@ -5,7 +5,8 @@ WinRepair: OS-aware Windows repair (Windows 7/Server 2008 R2 and newer).
 - Windows Server 2012+: ask for source immediately, but allow default source.
 - Check the system volume before Windows repair (Repair-Volume or CHKDSK).
 - Windows 7 / Server 2008 R2 and earlier: no unsupported RestoreHealth; run SFC.
-- Run SFC after DISM, including failed DISM; Ctrl+C cancels the entire script.
+- Run SFC even if DISM fails. Offer a safe in-place Windows Setup from selected media on failure.
+- Ctrl+C cancels the script.
 - No WSUS policy changes, component cleanup or cache reset; reboot only with consent.
 - Compatible with Windows PowerShell 2.0 (shipped with Windows 7).
 #>
@@ -56,6 +57,10 @@ $script:RestartInitiated = $false
 $script:HadError = $false
 $script:TranscriptOn = $false
 $script:LogPath = $null
+$script:SelectedRepairImage = $null
+$script:SelectedRepairDetails = $null
+$script:SelectedRepairIndex = 0
+$script:SetupLaunched = $false
 $script:ProgramDirectory = Join-Path $env:SystemRoot 'System32'
 if (($env:PROCESSOR_ARCHITEW6432 -ne $null) -and ($env:PROCESSOR_ARCHITEW6432 -ne '')) {
     # Running 32-bit PowerShell on a 64-bit OS: use native system binaries.
@@ -216,9 +221,9 @@ function Get-ImageDetails {
     }
     $body = $output.Substring($detailsHeading.Index + $detailsHeading.Length)
     $result = New-Object PSObject -Property @{
-        Edition = ''; Architecture = ''; Installation = ''; Language = ''; Version = ''; ServicePackBuild = ''
+        Name = ''; Edition = ''; Architecture = ''; Installation = ''; Language = ''; Version = ''; ServicePackBuild = ''
     }
-    foreach ($name in @('Edition', 'Architecture', 'Installation', 'Version')) {
+    foreach ($name in @('Name', 'Edition', 'Architecture', 'Installation', 'Version')) {
 
         $match = [regex]::Match($body, ('(?im)^\s*{0}\s*:\s*(.*?)\s*$' -f $name))
         if ($match.Success) { $result.$name = $match.Groups[1].Value.Trim() }
@@ -502,6 +507,130 @@ function Test-SystemVolume {
     Schedule-SystemVolumeCheck -Drive $drive
 }
 
+
+# Only offer Setup from an installation source that was already explicitly
+# selected for DISM. /Auto Upgrade preserves BOTH applications and data; if
+# unsupported, Windows Setup must fail instead of switching to DataOnly/Clean.
+function Offer-InPlaceWindowsSetup {
+    param([string]$OsCaption, $OsProfile, [bool]$IsServer, [version]$OsVersion)
+
+    if ($IsServer -or ($OsVersion -lt [version]'10.0')) {
+        Write-Host 'Автоматический запуск Setup предлагается только для Windows 10/11; для других ОС используйте установщик вручную.' -ForegroundColor Yellow
+        return
+    }
+    $image = [string]$script:SelectedRepairImage
+    if ([string]::IsNullOrEmpty($image)) {
+        Write-Host 'Установочный ISO не был выбран. Смонтируйте совместимый ISO и запустите setup.exe вручную.' -ForegroundColor Yellow
+        return
+    }
+    # Require an image in the standard sources folder and setup.exe on the
+    # very same media; a random .wim/.esd cannot safely identify its installer.
+    $match = [regex]::Match($image, '(?i)^([A-Z]:)\\sources\\install\.(?:wim|esd)$')
+    if (-not $match.Success) {
+        Write-Host 'Источник WIM/ESD не находится в стандартной папке sources на установочном носителе.' -ForegroundColor Yellow
+        Write-Host 'Запустите setup.exe вручную с подходящего ISO Windows.' -ForegroundColor Yellow
+        return
+    }
+    $setup = Join-Path ($match.Groups[1].Value + '\') 'setup.exe'
+    if (-not (Test-Path -LiteralPath $setup -PathType Leaf)) {
+        Write-Host ('На носителе не найден установщик: ' + $setup) -ForegroundColor Yellow
+        return
+    }
+    $index = [int]$script:SelectedRepairIndex
+    if ($index -le 0) {
+        Write-Host 'Индекс образа не выбран. Запуск Setup отменён.' -ForegroundColor Yellow
+        return
+    }
+    # Re-read metadata for exactly the index being passed to setup.exe.
+    # Do not rely on the earlier DISM choice if media content has changed.
+    $details = Get-ImageDetails -ImagePath $image -ImageIndex $index
+    if ($null -eq $details) {
+        Write-Host 'Не удалось подтвердить метаданные установочного образа; запускайте Setup вручную.' -ForegroundColor Yellow
+        return
+    }
+    if (($OsProfile.Edition -eq '') -or ($details.Edition -ieq '') -or
+        ($details.Edition -ine $OsProfile.Edition)) {
+        Write-Host ('Редакция ISO не подтверждена: установлена {0}, выбран индекс {1} ({2}).' -f $OsProfile.Edition, $script:SelectedRepairIndex, $details.Edition) -ForegroundColor Yellow
+        Write-Host 'Автоматический запуск Setup отменён: сначала проверьте редакцию образа.' -ForegroundColor Yellow
+        return
+    }
+    if (($OsProfile.Architecture -eq '') -or ($details.Architecture -eq '') -or
+        ($details.Architecture -ine $OsProfile.Architecture) -or
+        ($details.Installation -ine 'Client')) {
+        Write-Host 'Архитектура или тип установки ISO не соответствует текущей Windows.' -ForegroundColor Yellow
+        return
+    }
+    if (($OsProfile.Language -eq '') -or ($details.Language -eq '') -or
+        ($details.Language -ine $OsProfile.Language)) {
+        Write-Host ('Не совпадает или не определён язык: текущий {0}; ISO {1}.' -f $OsProfile.Language, $details.Language) -ForegroundColor Yellow
+        Write-Host 'Для сохранения приложений язык установочного носителя должен соответствовать языку исходной установки Windows.' -ForegroundColor Yellow
+        return
+    }
+    try {
+        $installed = [version]$OsProfile.Version
+        $target = [version]$details.Version
+        if ($target -lt $installed) {
+            Write-Host ('ISO содержит более раннюю версию Windows ({0} < {1}).' -f $target, $installed) -ForegroundColor Yellow
+            Write-Host 'Автоматический запуск Setup отменён, чтобы избежать отката версии.' -ForegroundColor Yellow
+            return
+        }
+    } catch {
+        Write-Host 'Не удалось надёжно сравнить версии Windows и образа. Запускайте Setup вручную.' -ForegroundColor Yellow
+        return
+    }
+
+    # Explicitly preserve apps and files. DynamicUpdate Disable avoids downloads
+    # during Setup, /EULA Accept avoids the extra Windows 11 license dialog.
+    # Explicitly specify the index already checked by DISM. No /Quiet or
+    # compatibility bypass: the user must see Setup and its warnings.
+    $args = ('/Auto Upgrade /ImageIndex {0} /DynamicUpdate Disable /EULA Accept' -f $index)
+    Write-Host ''
+    $targetVersion = [string]$details.Version
+    if (($details.ServicePackBuild -ne '') -and ($details.ServicePackBuild -ne '0')) {
+        $targetVersion += '.' + $details.ServicePackBuild
+    }
+    Write-Host '================== СРАВНЕНИЕ РЕДАКЦИЙ ==================' -ForegroundColor Cyan
+    Write-Host 'Текущая Windows:' -ForegroundColor Cyan
+    Write-Host ('  Название:       {0}' -f $OsCaption)
+    Write-Host ('  Редакция:       {0}' -f $OsProfile.Edition)
+    Write-Host ('  Версия:         {0}' -f $OsProfile.Version)
+    Write-Host ('  Архитектура:    {0}' -f $OsProfile.Architecture)
+    Write-Host ('  Язык:           {0}' -f $OsProfile.Language)
+    Write-Host ('Образ ISO (индекс {0}):' -f $index) -ForegroundColor Cyan
+    Write-Host ('  Название:       {0}' -f $details.Name)
+    Write-Host ('  Редакция:       {0}' -f $details.Edition)
+    Write-Host ('  Версия:         {0}' -f $targetVersion)
+    Write-Host ('  Архитектура:    {0}' -f $details.Architecture)
+    Write-Host ('  Язык:           {0}' -f $details.Language)
+    Write-Host ('  Установщик:    {0}' -f $setup)
+    Write-Host 'Совпадение редакции, архитектуры и языка подтверждено; версию ISO проверили.' -ForegroundColor Green
+    Write-Host 'Внимательно проверьте обе редакции и индекс перед запуском.' -ForegroundColor Yellow
+    Write-Host 'Параметры установки:'
+    Write-Host '  /Auto Upgrade       — обновление с сохранением приложений и файлов; несовместимость приведёт к отказу, не к чистой установке.'
+    Write-Host ('  /ImageIndex {0}       — установить выбранный образ с индексом {0} ({1}).' -f $index, $details.Name)
+    Write-Host '  /DynamicUpdate Disable — не загружать обновления и драйверы во время установки.'
+    Write-Host '  /EULA Accept        — принять лицензионное соглашение Windows.'
+    Write-Host '  /Quiet НЕ используется: окна установки и предупреждения остаются видимыми.'
+    Write-Host 'Внимание: заранее сохраните важные данные. Установка может перезагружать компьютер.' -ForegroundColor Yellow
+    Write-Host ('Команда: & ''{0}'' {1}' -f $setup.Replace("'", "''"), $args)
+    if (-not (Ask-YesNo ('Запустить установку Windows поверх с сохранением программ и данных ({0})?' -f $args) $true)) {
+        Write-Host 'Запуск установки отменён пользователем.'
+        return
+    }
+    try {
+        # No -Wait: Windows Setup has its own UI and reboot sequence.
+        $process = Start-Process -FilePath $setup -ArgumentList $args -PassThru -ErrorAction Stop
+        if ($null -eq $process) { throw 'Start-Process не вернул сведения о процессе.' }
+        $script:SetupLaunched = $true
+        Write-Host ('Windows Setup запущен (PID {0}). Следите за его окном и проверками совместимости.' -f $process.Id) -ForegroundColor Green
+    } catch [System.Management.Automation.PipelineStoppedException] {
+        throw
+    } catch {
+        $script:HadError = $true
+        Write-Host ('Не удалось запустить Windows Setup: ' + $_.Exception.Message) -ForegroundColor Red
+    }
+}
+
 function Try-RepairFromImage {
     param([string]$OsCaption, $OsProfile, [bool]$IsServer)
     $image = Choose-Image
@@ -511,6 +640,11 @@ function Try-RepairFromImage {
     # The image name/edition may match while its servicing build differs.
     # Show the image version so the user can diagnose a missing repair payload.
     $details = Get-ImageDetails -ImagePath $image -ImageIndex $index
+    # Keep the exact media and selected edition for an optional in-place Setup.
+    # This is only a candidate; Windows Setup performs its own compatibility check.
+    $script:SelectedRepairImage = [string]$image
+    $script:SelectedRepairIndex = [int]$index
+    $script:SelectedRepairDetails = $details
     if (($null -ne $details) -and (-not [string]::IsNullOrEmpty($details.Version))) {
         $displayVersion = [string]$details.Version
         if (($details.ServicePackBuild -ne '') -and ($details.ServicePackBuild -ne '0')) {
@@ -584,7 +718,7 @@ try {
     Write-Host ('ОС: {0} (версия {1})' -f $os.Caption, $os.Version)
     Write-Host ('Редакция: {0}; тип: {1}' -f $edition, $(if ($isServer) { 'Server' } else { 'Client' }))
     Write-Host '==============================================================='
-    Write-Host 'Скрипт не изменяет WSUS, не чистит кэш и не перезагружает ОС без разрешения.'
+    Write-Host 'Скрипт не изменяет WSUS и не чистит кэш; запуск установки Windows и перезагрузка — только после подтверждения.'
     Write-Host 'Ctrl+C — прервать всю диагностику (включая текущую операцию).' -ForegroundColor Yellow
 
     Test-SystemVolume -OsVersion $version
@@ -679,6 +813,10 @@ try {
         Write-Host 'Select-String -Path "$env:windir\Logs\CBS\CBS.log" -Pattern "CSI Payload Corrupt","CBS_E_","Missing replacement","Failed to resolve","0x800f" | Select-Object -Last 30'
     }
     Write-Host '=================================================='
+    if (($null -ne $script:DiskResult) -and ($script:DiskResult -ne 0) -and
+        ($script:DiskResult -ne 3010) -and (-not $script:VolumeScheduled)) {
+        Offer-InPlaceWindowsSetup -OsCaption $os.Caption -OsProfile $profile -IsServer $isServer -OsVersion $version
+    }
     if ($script:VolumeScheduled) {
         Write-Host 'Сохраните файлы перед перезагрузкой; затем повторите WinRepair.'
         $script:RestartRequested = Ask-YesNo 'Перезагрузить компьютер сейчас?' $false
