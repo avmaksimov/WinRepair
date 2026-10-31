@@ -16,15 +16,23 @@ Windows repair diagnostics for **Windows 7/8/8.1/10/11** and compatible Windows 
 
 ## Run
 
-Right-click `WinRepair.ps1` and select **Run with PowerShell**, or invoke `& '.\WinRepair.ps1'` in a PowerShell console. It requests elevation with UAC if needed; Explorer-launched windows, including already-elevated launches, wait for a key at completion. Separately started PowerShell processes with `-File` / `-Command` also pause. It stays interactive and writes a PowerShell transcript to `%TEMP%\WinRepair\Logs` (subject to normal temporary-file cleanup). Windows-owned DISM/CBS logs remain at `%windir%\Logs\DISM\dism.log` and `%windir%\Logs\CBS\CBS.log`. Previously created `%ProgramData%\WinRepair\Logs` logs are not deleted automatically.
+Right-click `WinRepair.ps1` and select **Run with PowerShell**, or invoke `& '.\WinRepair.ps1'` in a PowerShell console. It requests elevation with UAC if needed; Explorer-launched windows, including already-elevated launches, wait for a key at completion. Separately started PowerShell processes with `-File` / `-Command` also pause. It stays interactive and writes a PowerShell transcript to `%TEMP%` (subject to normal temporary-file cleanup). Windows-owned DISM/CBS logs remain at `%windir%\Logs\DISM\dism.log` and `%windir%\Logs\CBS\CBS.log`. Previously created `%ProgramData%\WinRepair\Logs` logs are not deleted automatically.
 
 WinRepair first checks the **system volume** (`%SystemDrive%`, usually `C:`). On Windows 8 / Server 2012 or later it prefers `Repair-Volume -Scan` and can offer `-SpotFix` / `-OfflineScanAndFix`. On Windows 7 / Server 2008 R2, or when the cmdlet is unavailable, it falls back to read-only `chkdsk`. Scheduling a boot-time fix and an immediate reboot each require explicit confirmation. DISM/SFC are postponed if a boot repair is scheduled. `/r` is not run by default.
 
-On Windows clients it first runs `DISM /Online /Cleanup-Image /RestoreHealth` using the default repair source. If this fails, it asks **`Y/N` (Enter defaults to Yes)** to try an install image. Windows Server prompts for an image before the first DISM attempt, allowing Enter to skip it. `SFC /scannow` follows DISM even when DISM fails, unless the operation is canceled.
+On Windows clients it first runs `DISM /Online /Cleanup-Image /RestoreHealth` using the default repair source. If this fails, it directly prompts the user to mount a Windows ISO and enter its drive letter (for example, `E`), or the full path to `install.wim`/`install.esd`, **without an extra Y/N question**. Enter skips this step and proceeds to SFC. If a selected image also fails, the tool can ask whether to try a different source. Windows Server prompts for an image before the first DISM attempt, allowing Enter to skip it. `SFC /scannow` follows DISM even when DISM fails, unless the operation is canceled.
 
-Image discovery checks `sources\install.wim`, `sources\install.esd`, and the same filenames in the root of available drives. It does not recursively scan all folders. If no image is found, mount a Windows ISO and enter a drive **letter in Latin characters**, such as `E`, or the full path to the WIM/ESD. Image edition lists and image-index verification help choose the proper index. Automatic selection only occurs when the metadata uniquely matches; otherwise the user confirms. Windows and selected image versions are shown, including a warning when different.
+Image discovery checks `sources\install.wim`, `sources\install.esd`, and the same filenames in the root of available drives. It does not recursively scan all folders. If no image is found, mount a Windows ISO and enter a drive **letter in Latin characters**, such as `E`, or the full path to the WIM/ESD. Image edition lists and image-index verification help choose the proper index. Automatic selection only occurs when the metadata uniquely matches; otherwise the user confirms. Windows and selected image versions are shown, including a warning when different. The image version is read from the DISM `Details for image` section (including `ServicePack Build`), never from the DISM tool banner.
 
-The program runs DISM and SFC as native console processes, preserving their usual progress and signed exit codes. Image repair permits the standard Windows Update fallback (no `/LimitAccess`), but domain policies and the available repair source may restrict actual downloads. The script does not download an ISO, install Windows updates, or change those policies.
+The program runs DISM and SFC as native console processes, preserving their usual progress and signed exit codes. Image repair permits the standard Windows Update fallback (no `/LimitAccess`), but domain policies and the available repair source may restrict actual downloads. The script does not download an ISO or change update policies. With explicit confirmation it can launch the Windows Setup installer to perform an in-place upgrade.
+
+## Optional in-place upgrade after failed DISM
+
+After SFC, WinRepair can offer to launch Windows Setup from the previously selected ISO when its edition, architecture, language and version are compatible (Windows 10/11 only). It asks **Y/N (Enter=Y)** and prints all switches: `/Auto Upgrade /ImageIndex N /DynamicUpdate Disable /EULA Accept`. These preserve applications and data, disable installation-time Dynamic Updates, and accept the EULA. Before asking Y/N, the tool re-reads the selected image metadata and compares installed Windows with the selected ISO index, showing name, edition, version, architecture and language for both; it then displays a blank line and asks for confirmation with the switches in the question. It intentionally avoids `/Quiet` and compatibility-bypass options. Setup exits rather than performing a data-only/clean install when `/Auto Upgrade` is incompatible. Back up important data before agreeing, and monitor Windows Setup's UI.
+
+### Optional ESD → WIM retry
+
+When repair using a selected `install.esd` fails, WinRepair offers to export **only that edition** to a temporary `install.wim` using `/Compress:fast` and retry DISM with WIM index 1. The original ESD is unchanged. The free-space check is an estimate; if insufficient, select another existing directory on a local fixed drive or skip the retry. Its unique `WinRepair-ESD-<GUID>` temporary folder is removed after the attempt, including ordinary errors and Ctrl+C. Forced termination or power failure can leave files behind. Converting to WIM cannot add missing component versions.
 
 ## Troubleshooting DISM failure (including 0x800F0915)
 
@@ -42,7 +50,7 @@ A matching Windows edition or image index **does not guarantee** that the chosen
 If the original console window closed, open PowerShell and read the most recent WinRepair log:
 
 ```powershell
-Get-ChildItem "$env:TEMP\WinRepair\Logs\WinRepair_*.log" | Sort-Object LastWriteTime -Descending | Select-Object -First 1 | Get-Content | Select-Object -Last 80
+Get-ChildItem "$env:TEMP\WinRepair_*.log" | Sort-Object LastWriteTime -Descending | Select-Object -First 1 | Get-Content | Select-Object -Last 80
 ```
 
 When DISM fails, WinRepair prints an additional copyable one-line command to inspect recent CBS error signatures, without automatically dumping a large log.

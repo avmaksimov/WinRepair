@@ -2,6 +2,7 @@
 <#
 WinRepair: OS-aware Windows repair (Windows 7/Server 2008 R2 and newer).
 - Windows client 8+: first try DISM with default source. Offer ISO/WIM/ESD on failure.
+- If a selected ESD fails, optionally export its edition to a temporary fast-compressed WIM and retry.
 - Windows Server 2012+: ask for source immediately, but allow default source.
 - Check the system volume before Windows repair (Repair-Volume or CHKDSK).
 - Windows 7 / Server 2008 R2 and earlier: no unsupported RestoreHealth; run SFC.
@@ -648,6 +649,78 @@ function Offer-InPlaceWindowsSetup {
     }
 }
 
+
+# Direct ESD repair is tried first. If it fails, the user may export the
+# selected edition to a temporary single-index WIM and retry from that WIM.
+# Returning $null means export was skipped/failed: retain the earlier DISM code.
+function Try-RepairFromTemporaryWim {
+    param([string]$EsdPath, [int]$EsdIndex)
+    $temporaryDir = $null
+    try {
+        $esdFile = Get-Item -LiteralPath $EsdPath -ErrorAction Stop
+        if ($esdFile.PSIsContainer) { throw 'ESD должен быть файлом.' }
+        # Heuristic only, not a guarantee: compression ratio depends on content.
+        $minimumFree = [long][Math]::Max(10GB, ([double]$esdFile.Length * 2 + 2GB))
+        $tempParent = [IO.Path]::GetTempPath()
+        Write-Host ''
+        Write-Host 'Резервный способ: экспорт выбранной редакции ESD во временный WIM (/Compress:fast).' -ForegroundColor Cyan
+        Write-Host ('Ориентир свободного места: {0:N1} GiB; фактический размер WIM может отличаться.' -f ($minimumFree / 1GB))
+        Write-Host 'Временный WIM будет удалён после попытки восстановления, в том числе при ошибке.'
+
+        while ($true) {
+            try {
+                $dir = Get-Item -LiteralPath $tempParent -ErrorAction Stop
+                if (-not $dir.PSIsContainer) { throw 'Указан не каталог.' }
+                $driveRoot = [IO.Path]::GetPathRoot($dir.FullName)
+                $drive = New-Object System.IO.DriveInfo -ArgumentList $driveRoot
+                if ($drive.DriveType -ne [IO.DriveType]::Fixed) { throw 'Нужен локальный диск.' }
+                if ($drive.AvailableFreeSpace -lt $minimumFree) { throw 'Недостаточно свободного места.' }
+                # Create a unique owned directory. We only ever delete this directory.
+                $temporaryDir = Join-Path $dir.FullName ('WinRepair-ESD-' + [guid]::NewGuid().ToString('N'))
+                New-Item -Path $temporaryDir -ItemType Directory -ErrorAction Stop | Out-Null
+                break
+            } catch [System.Management.Automation.PipelineStoppedException] {
+                throw
+            } catch {
+                Write-Host ('Каталог {0}: {1}' -f $tempParent, $_.Exception.Message) -ForegroundColor Yellow
+                $tempParent = (Read-Host 'Другой существующий каталог на локальном диске (Enter — пропустить)').Trim().Trim('"')
+                if ($tempParent.Length -eq 0) { return $null }
+            }
+        }
+
+        $temporaryWim = Join-Path $temporaryDir 'install.wim'
+        Write-Host ('Экспорт ESD, индекс {0}, во временный WIM...' -f $EsdIndex) -ForegroundColor Cyan
+        # Export creates a single-image WIM; its new index is always 1.
+        $exportArgs = '/Export-Image /SourceImageFile:"{0}" /SourceIndex:{1} /DestinationImageFile:"{2}" /Compress:fast /CheckIntegrity' -f $EsdPath, $EsdIndex, $temporaryWim
+        $exportCode = Invoke-RepairExecutable -Executable $script:DismExe -Arguments $exportArgs
+        if ($exportCode -ne 0) {
+            Write-Host ('Экспорт завершился ошибкой: ' + (Format-ExitCode $exportCode)) -ForegroundColor Red
+            return $null
+        }
+        if (-not (Test-Path -LiteralPath $temporaryWim -PathType Leaf)) {
+            Write-Host 'DISM не создал временный WIM.' -ForegroundColor Red
+            return $null
+        }
+        $size = (Get-Item -LiteralPath $temporaryWim -ErrorAction Stop).Length
+        Write-Host ('WIM создан: {0:N1} GiB. Повторяю восстановление с индексом 1.' -f ($size / 1GB)) -ForegroundColor Cyan
+        return (Run-Dism -ImagePath $temporaryWim -ImageIndex 1)
+    } catch [System.Management.Automation.PipelineStoppedException] {
+        throw
+    } catch {
+        Write-Host ('Не удалось подготовить временный WIM: ' + $_.Exception.Message) -ForegroundColor Yellow
+        return $null
+    } finally {
+        if (($null -ne $temporaryDir) -and (Test-Path -LiteralPath $temporaryDir)) {
+            try {
+                Remove-Item -LiteralPath $temporaryDir -Recurse -Force -ErrorAction Stop
+                Write-Host 'Временный WIM удалён.' -ForegroundColor Green
+            } catch {
+                Write-Host ('Не удалось удалить временный WIM. Удалите вручную: {0}. {1}' -f $temporaryDir, $_.Exception.Message) -ForegroundColor Yellow
+            }
+        }
+    }
+}
+
 function Try-RepairFromImage {
     param([string]$OsCaption, $OsProfile, [bool]$IsServer, [switch]$AskForDrive)
     $image = Choose-Image -AskForDrive:$AskForDrive
@@ -673,7 +746,17 @@ function Try-RepairFromImage {
             Write-Host 'Для DISM /RestoreHealth важно наличие конкретных версий повреждённых компонентов.' -ForegroundColor Yellow
         }
     }
-    return (Run-Dism -ImagePath $image -ImageIndex $index)
+    $code = Run-Dism -ImagePath $image -ImageIndex $index
+    if (($code -ne 0) -and ($code -ne 3010) -and
+        $image.EndsWith('.esd', [StringComparison]::OrdinalIgnoreCase)) {
+        Write-Host ''
+        if (Ask-YesNo 'ESD не помог. Экспортировать выбранный индекс во временный WIM и повторить DISM?' $true) {
+            $retryCode = Try-RepairFromTemporaryWim -EsdPath $image -EsdIndex $index
+            if ($null -ne $retryCode) { $code = [int]$retryCode }
+            else { Write-Host 'Резервное восстановление через WIM не выполнялось; исходная ошибка DISM сохраняется.' -ForegroundColor Yellow }
+        }
+    }
+    return $code
 }
 
 try {
