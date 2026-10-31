@@ -856,7 +856,7 @@ try {
                     # A mounted ISO can now be entered without an extra Y/N prompt.
                     Write-Host ''
                     Write-Host 'DISM не смог восстановить Windows со штатным источником.' -ForegroundColor Yellow
-                    $ret = Try-RepairFromImage -OsCaption $os.Caption -OsProfile $profile -IsServer $isServer -AskForDrive
+                    $ret = Try-RepairFromImage -OsCaption $os.Caption -OsProfile $profile -IsServer $isServer
                     if ($null -ne $ret) { $script:DiskResult = $ret }
                     else { Write-Host 'Источник восстановления не выбран. Переходим к SFC.' -ForegroundColor Yellow }
                 } elseif (Ask-YesNo 'Восстановление с выбранным образом не удалось. Попробовать другой ISO/WIM/ESD?' $true) {
