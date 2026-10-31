@@ -10,26 +10,27 @@ WinRepair: OS-aware Windows repair (Windows 7/Server 2008 R2 and newer).
 - No WSUS policy changes, component cleanup or cache reset; reboot only with consent.
 - Compatible with Windows PowerShell 2.0 (shipped with Windows 7).
 #>
-# Internal switch used by the elevated child to keep its console visible.
-param([switch]$PauseAtExit)
+# Internal switches preserve the launch mode when relaunching via UAC.
+param([switch]$PauseAtExit, [switch]$NoPauseAtExit)
 
-# Keep the existing caller's PowerShell console open when elevating.
-# A new elevated instance waits for a key before its window closes.
+# Only an Explorer-initiated, dedicated PowerShell process waits for a key.
+# -File alone is insufficient: terminals can use powershell.exe -File too.
 function Test-ExplorerLaunch {
     try {
         if (-not [Environment]::UserInteractive) { return $false }
-        # Explorer and UAC may launch PowerShell via another intermediate
-        # process. A process started with -File/-Command has its own lifetime;
-        # pause it regardless of parent ancestry. Invoking this script with &
-        # in an existing interactive console does not open a new process.
         $current = Get-WmiObject -Class Win32_Process -Filter ("ProcessId = {0}" -f $PID) -ErrorAction Stop
         if ($null -eq $current) { return $false }
-        return ([string]$current.CommandLine -match '(?i)(?:^|\s)-(?:file|command)\b')
-    } catch {
-        # If parent/command line inspection fails, prefer a visible result for
-        # console sessions rather than closing the diagnostic window.
-        return [Environment]::UserInteractive
-    }
+        $commandLine = [string]$current.CommandLine
+        # -NoExit indicates a console that the caller explicitly keeps open.
+        if ($commandLine -match '(?i)(?:^|\s)-noexit\b') { return $false }
+        if ($commandLine -notmatch '(?i)(?:^|\s)-(?:file|command)\b') { return $false }
+        $parent = Get-WmiObject -Class Win32_Process -Filter ("ProcessId = {0}" -f $current.ParentProcessId) -ErrorAction Stop
+        if ($null -eq $parent) { return $false }
+        # An already elevated Explorer launch may be parented by UAC AppInfo
+        # (svchost.exe) instead of explorer.exe.
+        $parentName = ([string]$parent.Name).ToLowerInvariant()
+        return (@('explorer.exe', 'svchost.exe', 'consent.exe') -contains $parentName)
+    } catch { return $false }
 }
 function Wait-ForExitKey {
     if (-not $script:PauseAtExit) { return }
@@ -43,7 +44,13 @@ function Wait-ForExitKey {
         try { [void](Read-Host 'Нажмите Enter для выхода') } catch { }
     }
 }
-$script:PauseAtExit = ([bool]$PauseAtExit -or (Test-ExplorerLaunch))
+if ($NoPauseAtExit) {
+    $script:PauseAtExit = $false
+} elseif ($PauseAtExit) {
+    $script:PauseAtExit = $true
+} else {
+    $script:PauseAtExit = Test-ExplorerLaunch
+}
 $script:ElevationStarted = $false
 
 
@@ -635,7 +642,8 @@ function Offer-InPlaceWindowsSetup {
         return
     }
     try {
-        # No -Wait: Windows Setup has its own UI and reboot sequence.
+        # Windows Setup runs independently. The console remains open at script
+        # exit only when the original launch was from Explorer.
         $process = Start-Process -FilePath $setup -ArgumentList $args -PassThru -ErrorAction Stop
         if ($null -eq $process) { throw 'Start-Process не вернул сведения о процессе.' }
         $script:SetupLaunched = $true
@@ -699,8 +707,14 @@ try {
                     Write-Host ('Сетевой диск: использую UNC-путь ' + $scriptFile)
                 }
             }
-            # Child explicitly pauses at completion (no persistent -NoExit session).
-            $arguments = '-NoProfile -ExecutionPolicy Bypass -File "{0}" -PauseAtExit' -f $scriptFile
+            # Preserve original launch mode for the elevated process. In
+            # particular, a terminal-origin UAC launch must NOT start pausing.
+            $arguments = '-NoProfile -ExecutionPolicy Bypass -File "{0}"' -f $scriptFile
+            if ($script:PauseAtExit) {
+                $arguments += ' -PauseAtExit'
+            } else {
+                $arguments += ' -NoPauseAtExit'
+            }
             # Use a guaranteed local working directory (not a mapped network drive).
             Start-Process -FilePath (Join-Path $PSHOME 'powershell.exe') `
                 -ArgumentList $arguments -Verb RunAs -WorkingDirectory $env:SystemRoot -ErrorAction Stop | Out-Null
@@ -867,6 +881,8 @@ try {
     if ($script:TranscriptOn) {
         try { Stop-Transcript | Out-Null } catch { }
     }
+    # Also applies after launching Setup; never pause the launching instance
+    # when it has handed off execution to a separate elevated process.
     if ((-not $script:ElevationStarted) -and (-not $script:RestartInitiated)) {
         Wait-ForExitKey
     }
